@@ -37,6 +37,14 @@ EXTRACT_CORPUS_CHARS = 100_000
 NAME_ONLY_CHARS = 400
 
 _NO_AFC = types.AutomaticFunctionCallingConfig(disable=True)
+RETRY = types.HttpRetryOptions(
+    attempts=4,
+    initial_delay=1.0,
+    max_delay=20.0,
+    exp_base=2.0,
+    jitter=0.3,
+    http_status_codes=[429, 500, 502, 503, 504],
+)
 
 _JSON_FENCE = re.compile(r"```(?:json)?\s*(.+?)\s*```", re.DOTALL)
 _JSON_OBJECT = re.compile(r"\{.*\}", re.DOTALL)
@@ -96,7 +104,10 @@ class ScholarshipAgent:
             )
 
         self.model_name = model_name or os.getenv("MODEL", DEFAULT_MODEL)
-        self.client = genai.Client(api_key=api_key)
+        self.client = genai.Client(
+            api_key=api_key,
+            http_options=types.HttpOptions(retry_options=RETRY),
+        )
         self.cache = ResultCache() if use_cache else None
 
     # --- public ----------------------------------------------------------

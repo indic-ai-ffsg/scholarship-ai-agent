@@ -64,6 +64,11 @@ it started with until something redeploys it.
     python server.py                  # http://127.0.0.1:8765
     python server.py --host 0.0.0.0 --port 9000
 
+**The tests**, which need no network, no Redis and no key:
+
+    .venv/bin/pip install -r requirements-dev.txt
+    .venv/bin/pytest
+
 Host and port are command-line flags. There are no `DISCOVERY_HOST` or
 `DISCOVERY_PORT` variables.
 
@@ -181,6 +186,14 @@ input by some distance.
 
 `NAME_ONLY_CHARS` is a constant in `src/agent.py` (400), not an environment
 variable.
+
+A transient answer from the model is retried before the source is given up on:
+429 and 5xx get four attempts with exponential backoff, capped so a source that
+will never succeed cannot hold the run open. 4xx is not retried - asking again
+after a 400 produces the same bad request, and a 404 is usually a model name
+that does not exist. This matters more than it looks: the extraction call is the
+LAST step, so a moment of "high demand" at Gemini used to throw away a page
+already fetched, rendered and read.
 
 Caching is content-addressed, not time-boxed: the seed page is re-fetched every
 run and hashed, so a cached record is reused only while the source is genuinely
@@ -385,9 +398,13 @@ exists. A gap that is named is a decision; a gap that is not is a surprise.
 - **Provenance.** Nothing records which page, or which sentence, a value came
   from, so "where did this come from?" is answered by opening the source again.
   The run log is the nearest thing and it is per-run, not per-field.
-- **Tests.** There are none, and `pytest` is not a dependency. Verification is
-  running an extraction and reading the record, which catches what somebody
-  thought to look at and nothing else.
+- **Broad test coverage.** There is a suite now - `pytest`, in `tests/`, run by
+  CI - but it covers the deterministic layer and the regressions that have
+  actually bitten: the chrome-stripping guard, the tier gate, the island
+  heading, normalise's corrections, the sweep's refusal to overwrite a record it
+  could not re-read. Nothing exercises the model, the cache or the HTTP surface,
+  so a green suite says the reading logic is intact and nothing about whether an
+  extraction is any good.
 
 ## Non-goals
 

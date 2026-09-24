@@ -8,3 +8,9 @@ __pycache__/
 .gitignore
 README.md
 demo.py
+
+# The suite and its runner. Neither is needed to serve a request, and a test
+# runner in a production image is a dependency to patch for no benefit.
+tests/
+conftest.py
+requirements-dev.txt

@@ -1,0 +1,9 @@
+# Test-only dependencies. Deliberately NOT in requirements.txt: the Dockerfile
+# installs that one, and a test runner in a production image is a dependency to
+# patch for no benefit.
+#
+#     .venv/bin/pip install -r requirements-dev.txt
+#     .venv/bin/pytest
+
+-r requirements.txt
+pytest>=8.0
