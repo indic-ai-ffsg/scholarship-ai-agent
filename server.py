@@ -301,12 +301,13 @@ class Handler(BaseHTTPRequestHandler):
         request = urllib.request.Request(VERIFY_URL, headers={
             "Authorization": token,
             "Accept": "application/json",
+            "User-Agent": "scholarship-discovery/1.0 (+admin run verification)",
         })
         try:
             with urllib.request.urlopen(request, timeout=VERIFY_TIMEOUT) as answer:
                 return 200 <= answer.status < 300
         except urllib.error.HTTPError as exc:
-            log.info("Run refused: the API answered %s.", exc.code)
+            log.warning("Run refused: %s answered %s.", VERIFY_URL, exc.code)
             return False
         except (urllib.error.URLError, OSError) as exc:
             log.warning("Could not check the caller with %s (%s) - refusing.", VERIFY_URL, exc)
