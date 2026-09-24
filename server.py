@@ -48,6 +48,7 @@ import requests
 from src.agent import DEFAULT_MODEL, ScholarshipAgent
 from src.cache import ResultCache
 from src.schema import SCHEMA_VERSION, ScholarshipSchema
+from src.sweeper import sweeper
 
 log = logging.getLogger(__name__)
 
@@ -226,6 +227,7 @@ def health() -> dict:
         "cache": _cache_status,
         "max_items": MAX_ITEMS,
         "schema_version": SCHEMA_VERSION,
+        "refresh_hours": sweeper.last()["interval_hours"],
         "reason": None if key else
                   "LLM_API_KEY is not set - copy .env.example to .env and add your Gemini key.",
     }
@@ -241,10 +243,18 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({
                 "service": "scholarship discovery",
                 "ui": "the admin panel, under Discovery",
-                "routes": ["/api/health", "/api/schema", "/api/runs", "/api/runs/<id>/events"],
+                "routes": [
+                    "/api/health", "/api/schema", "/api/runs",
+                    "/api/runs/<id>/events", "/api/refresh",
+                ],
             })
         if path == "/api/health":
             return self._json(health())
+        # Read-only, and deliberately outside _permitted: it spends nothing, and
+        # a panel that cannot show "three deadlines moved last night" without a
+        # token is a panel that will not show it at all.
+        if path == "/api/refresh":
+            return self._json(sweeper.last())
         if path == "/api/schema":
             return self._json(ScholarshipSchema.model_json_schema())
         if path == "/api/logo":
@@ -263,6 +273,9 @@ class Handler(BaseHTTPRequestHandler):
             )
         if path == "/api/runs":
             return self._create_run()
+        if path == "/api/refresh":
+            started = sweeper.start_in_background(reason="asked for")
+            return self._json({"started": started, "running": True}, status=202)
         match = _RUN_CANCEL.match(path)
         if match:
             job = jobs.get(match.group(1))
@@ -477,6 +490,14 @@ def main(argv: list[str] | None = None) -> int:
     if not os.getenv("LLM_API_KEY"):
         print("LLM_API_KEY is not set - the page will load, but a run will fail.", file=sys.stderr)
     _cache_status = "redis" if ResultCache().enabled else "off"
+
+    hours = sweeper.start()
+    print(
+        f"Re-checking watched pages every {hours:g}h"
+        if hours else
+        "Automatic re-checking is off (set DISCOVERY_REFRESH_HOURS to turn it on).",
+        file=sys.stderr,
+    )
 
     try:
         httpd = ThreadingHTTPServer((opts.host, opts.port), Handler)

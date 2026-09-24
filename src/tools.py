@@ -12,7 +12,6 @@ import time
 from urllib.parse import urlparse
 
 from google.genai import types
-
 from src.fetcher import Page, fetch_page
 from src.scrapers import FetchError
 

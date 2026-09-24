@@ -34,18 +34,6 @@ _HEADERS = {
     )
 }
 
-# Split in two, because the two halves are not equally safe to remove.
-#
-# The first four hold no prose at any depth, so removing them cannot cost
-# content. The second five are PAGE CHROME - and only when they are the page's
-# chrome. HTML5 allows a <header> inside every sectioning element, and an older
-# government template will happily wrap its entire body in <header> or <nav>;
-# depwd.gov.in/scholarships does exactly that. Stripping by tag name there took
-# a 3,371-character page down to 393, which is below MIN_USEFUL_CHARS, so it
-# rendered in Chromium (six seconds, same 393 characters) and then raised
-# FetchError. A page that was perfectly readable failed to extract at all.
-#
-# See extract_text_from_html for the guard that keeps that from happening.
 _INERT_TAGS = ("script", "style", "noscript", "svg")
 _CHROME_TAGS = ("nav", "header", "footer", "aside", "form")
 
@@ -227,17 +215,6 @@ def extract_text_from_html(html: str) -> tuple[str, str]:
         element.decompose()
     visible = soup.get_text(separator="\n", strip=True)
 
-    # The guard. Stripping chrome is right on a page that HAS chrome, and
-    # catastrophic on one that mislabels its content as chrome - and the two are
-    # indistinguishable by tag name, which is why this is measured instead of
-    # guessed at.
-    #
-    # It fires only when the strip is the difference between a usable page and a
-    # failed one: below the floor after, above it before. That is deliberately
-    # narrow. On an ordinary page a mega-menu really can be half the text and
-    # removing it really is the right answer, so a share-based rule ("keep the
-    # unstripped text when stripping costs more than 60%") would fire constantly
-    # and put every navigation menu back into the extraction corpus.
     if len(visible) < MIN_USEFUL_CHARS <= len(whole):
         log.info(
             "Chrome tags held %d of %d characters - keeping them; this page marks "
@@ -248,7 +225,16 @@ def extract_text_from_html(html: str) -> tuple[str, str]:
     return visible, embedded
 
 
+EMBEDDED_HEADING = (
+    "--- embedded page data (from the page's own scripts; it is build-time and "
+    "can be out of date, so where it disagrees with the text above, the text "
+    "above is what the page actually shows) ---"
+)
+
+
 def join_text(visible: str, embedded: str) -> str:
+    if visible and embedded:
+        return f"{visible}\n\n{EMBEDDED_HEADING}\n{embedded}"
     return "\n\n".join(p for p in (visible, embedded) if p)
 
 
@@ -302,7 +288,6 @@ def _flatten(node, lines: list[str], seen: set[str], key: str = "") -> None:
         return
 
     if isinstance(node, (int, float)):
-        # Timestamps and numeric ids carry no meaning for extraction.
         if key.lower().endswith("id") or abs(node) > 10_000_000:
             return
         text = str(node)

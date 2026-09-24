@@ -104,7 +104,9 @@ class ScholarshipAgent:
         record, _ = self.run(raw_input)
         return record
 
-    def run(self, raw_input: str, reuse: bool = True) -> tuple[dict, Report]:
+    def run(
+        self, raw_input: str, reuse: bool = True, ground_on_failure: bool = True,
+    ) -> tuple[dict, Report]:
         """Extract, and report whether the source moved since it was last read.
 
         `reuse=False` re-reads a source whose cached record would otherwise be
@@ -127,6 +129,20 @@ class ScholarshipAgent:
                 seed = fetch_page(text)
                 fingerprint = ResultCache.key_for(seed.text)
             except FetchError as exc:
+                # Searching for a page we could not read is right when somebody
+                # has just asked for that URL: they want the scheme, the address
+                # was only how they named it, and a grounded draft marked as
+                # grounded is better than nothing.
+                #
+                # It is wrong on a sweep, and the sweep is what made that
+                # visible. A watched URL whose host is down for ten minutes was
+                # searched for instead, and the empty record that came back was
+                # written over the good one - award_amount 45,000 to null,
+                # closes_at to null, the name to "Unknown Scholarship". Nobody
+                # asked for that page today; it was being re-checked, and "the
+                # site did not answer" is the honest answer to a re-check.
+                if not ground_on_failure:
+                    raise
                 log.warning("Could not read %s - %s. Falling back to search grounding.", text, exc)
                 report.grounded = True
                 fingerprint = ResultCache.key_for(text)

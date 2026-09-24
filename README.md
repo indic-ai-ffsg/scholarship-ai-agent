@@ -49,8 +49,10 @@ somebody presses Save there.
     POST /api/runs              start a run over a list of sources
     GET  /api/runs/<id>/events  follow it - the agent's own log, as it happens
     POST /api/runs/<id>/cancel  stop after the source being read now
+    GET  /api/refresh           what the last re-check of watched pages found
+    POST /api/refresh           re-check them now (202; poll the GET)
     GET  /api/schema            the record shape, from src/schema.py
-    GET  /api/health            model, cache, schema version
+    GET  /api/health            model, cache, schema version, refresh interval
 
 Every route is also served under `DISCOVERY_PATH_PREFIX` (default `/discovery`),
 which is stripped when present - so `/discovery/api/health` and `/api/health` are
@@ -104,20 +106,34 @@ it cannot click, type, scroll or work a dropdown. See "Not built yet" below.
 
     URL
      |
-     +-- plain request -- enough text AND links to follow? --yes--> gather -> extract
+     +-- plain request -- enough VISIBLE text AND links to follow? --yes--> gather -> extract
      |                         |
      |                         no
      |                         |
      +-------------------> Chromium (src/render.py) -- still short? --> FetchError
 
-Both halves of that test matter, and the second one was missing until
-2026-09-24. A page can return plenty of text and no followable links - a
-Next.js listing whose text comes from the SEO blob in `__NEXT_DATA__` while the
-listing itself loads after hydration - and that is not a page that was read, it
-is a dead end for the gather stage, which navigates by links. Rendering
-buddy4study.com/scholarships turns 13,883 characters and 0 links into 43,140
-and 60. The rendered read is kept only when it is actually better, so an
-ordinary page that simply has no links falls back to the plain one.
+Both halves of that test matter, and both were wrong until 2026-09-24.
+
+**Visible**, because the text a page yields is visible DOM plus the JSON
+islands in its scripts, and a fat island hides an empty page. The plain fetch
+of sbiashascholarship.co.in returns 74 characters of DOM and 4,834 of island:
+4,910 joined, comfortably over the floor, recorded as a clean read of a page
+whose content had not loaded. What made that more than a missed opportunity is
+that the island's `applicationDeadline` is a build-time constant the site never
+updated - 2026-07-31, where the rendered page says the last date was 19
+September 2026. The extraction was faithful to the stale half and reported a
+deadline seven weeks early.
+
+**And links**, because a page can return plenty of text and nothing to follow,
+which is a dead end for the gather stage. Rendering buddy4study.com/scholarships
+turns 14,072 characters and 0 links into 43,329 and 60.
+
+The rendered read has to earn the swap - more visible text or more links than
+the plain one - so a page that genuinely lives in its island falls back rather
+than being replaced by a worse render. Where both halves of the corpus survive,
+the island is written under a heading saying it is build-time data and that the
+text above it wins, because unlabelled the two contradictory deadlines reach the
+model as one block of prose.
 
 Chrome tags are stripped with a guard for the same kind of reason. `<nav>`,
 `<header>`, `<footer>`, `<aside>` and `<form>` are page furniture on most
@@ -142,6 +158,42 @@ variable.
 Caching is content-addressed, not time-boxed: the seed page is re-fetched every
 run and hashed, so a cached record is reused only while the source is genuinely
 unchanged. Redis is optional - without it, every run calls the model.
+
+## Keeping records up to date
+
+A sponsor moves a deadline and says nothing. `src/watch.py` has always been able
+to notice - every URL that is extracted is watched, and a sweep re-fetches each
+one, hashes it, and calls the model only for the pages whose text actually
+moved. What it lacked was anything to run it: `python main.py --refresh`, by
+hand, printing to a terminal.
+
+Set `DISCOVERY_REFRESH_HOURS` and the running service sweeps on that interval.
+Unset or `0` - the default - and it does not, because a service that starts
+spending because somebody ran `python server.py` is not a good default.
+
+    GET  /api/refresh     the last sweep: when, what moved, and what it now says
+    POST /api/refresh     sweep now - 202, then poll the GET
+
+A sweep over ten watched pages takes about two and a half minutes, most of it
+re-fetching. The result names each watched scheme, its deadline status (`open`,
+`closing_soon`, `closed`, `unknown`, `error`) and, for the ones that moved, the
+fields that changed with their before and after.
+
+**Nothing is written back.** The Go API owns every listing; this service owns
+reading pages. A moved deadline is a finding an operator acts on, the same
+boundary the draft flow already draws. The first sweep after the SBI Asha fix
+reported `closed 5 day(s) ago (2026-09-19)` where the platform still had 31
+July - which is the whole point of it, but changing the listing is still
+somebody's decision.
+
+One thing a sweep must never do is damage what it was checking. A re-check that
+cannot reach its page reports `error` and leaves the stored record alone; it
+does not fall back to searching for the URL the way a first extraction does.
+That fallback is right when somebody has just asked for a page - a grounded
+draft beats nothing - and wrong on a timer, where a host that is down for ten
+minutes had its good record replaced by an empty searched one: award amount to
+null, name to "Unknown Scholarship". `agent.run(..., ground_on_failure=False)`
+is what the sweep passes.
 
 ## What comes back
 
@@ -226,10 +278,8 @@ actually uses, is in `.env.example`.
 
 ```env
 LLM_API_KEY=                          # required
-
-# MODEL=                              # required
-
-# REDIS_URL=redis://localhost:6379/0  # or REDIS_HOST / REDIS_PORT
+MODEL=                                # required
+REDIS_URL=redis://localhost:6379/0    # or REDIS_HOST / REDIS_PORT
 
 # SCHOLARSHIP_MAX_PAGES=5             # pages per extraction, including the seed
 # SCHOLARSHIP_MAX_STEPS=8             # tool-calling turns
@@ -290,20 +340,36 @@ Extraction lives in `agent.py`; there is no `extract.py` and no `models.py`.
 
 ## Not built yet
 
-Named here because the architecture invites them and neither exists:
+Written down because the architecture invites all three, and none of them
+exists. A gap that is named is a decision; a gap that is not is a surprise.
 
-- **A browser agent.** The gather stage reads text and follows links; it cannot
-  interact with a page. Portals whose content sits behind dropdowns, tabs or
-  pagination with no distinct URL are the case it cannot read, and the fix is an
-  interactive tier under `fetch_page`, not a change to gather.
-- **Provenance.** Nothing records which page and which sentence a value came
-  from, so "where did this come from?" is answered by re-reading the source. The
-  run log is the nearest thing.
-- **Tests.** There are none, and `pytest` is not a dependency. Verification today
-  is running an extraction and reading the record.
+- **A browser agent.** Gather reads text and follows links. It cannot click a
+  tab, work a dropdown, submit a filter or page through results, so a portal
+  whose schemes have no distinct URL is one it cannot reach. The fix is an
+  interactive tier under `fetch_page`, not a change to gather - the escalation
+  belongs where the other two tiers are, and gather should go on choosing pages
+  rather than learning to drive a browser.
+- **Provenance.** Nothing records which page, or which sentence, a value came
+  from, so "where did this come from?" is answered by opening the source again.
+  The run log is the nearest thing and it is per-run, not per-field.
+- **Tests.** There are none, and `pytest` is not a dependency. Verification is
+  running an extraction and reading the record, which catches what somebody
+  thought to look at and nothing else.
 
 ## Non-goals
 
-Not a general-purpose crawler, not a search engine, not a document store, not
-the platform database, not an unrestricted browser, and not a replacement for
+Not a general-purpose crawler. Not a search engine. Not a document store, not
+the platform database, and not an unrestricted browser. Not a replacement for
 the operator who presses Save.
+
+Those are refusals rather than omissions, and they share a reason. Everything
+here is disposable except the reading: the Redis cache can be dropped at any
+moment and re-earned from the source pages, and that stays true only while this
+service owns nothing anybody depends on. The moment it stores a record the
+platform trusts, or browses without a budget, or answers a question the Go API
+should answer, it stops being a thing you can delete and rebuild on a whim -
+and that property is worth more than any of the features above.
+
+---
+
+Copyright © 2026 Indic AI Foundation for Social Good. All rights reserved.

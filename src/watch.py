@@ -59,7 +59,7 @@ def refresh(agent: ScholarshipAgent, urls: list[str] | None = None) -> list[Even
 
 def _check(agent: ScholarshipAgent, url: str) -> Event:
     try:
-        record, report = agent.run(url)
+        record, report = agent.run(url, ground_on_failure=False)
     except (FetchError, RuntimeError, ValueError) as exc:
         log.warning("Could not re-check %s - %s", url, exc)
         return Event(url=url, status="error", detail=str(exc)[:160])
