@@ -1,16 +1,26 @@
-# Scholarship agent intelligence
+# Scholarship AI Agent
 
 Reads a scholarship page - or a block of pasted text - and returns one
 structured record: dates, award amounts, eligibility, documents and the
-application steps, with `null` wherever the source does not actually say.
+application steps, with `null` wherever the source does not actually say. It
+re-checks the pages it has read, so a sponsor who moves a deadline without
+announcing it does not go unnoticed.
 
 The rule the whole service is built around:
 
 > Never invent a value. If the source does not state it, return `null`.
 
-The record is shaped for the Go API's `CuratedInput` rather than for what reads
-nicely off a web page, which is what lets extracted eligibility become rules the
-matcher evaluates instead of a paragraph nobody can match on.
+**It does not match students to scholarships, and it does not go looking for
+sources.** Matching is the Go API's `internal/matching`; finding a scheme worth
+reading is a person's job, and this reads what it is handed. The one exception
+is a paste too short to be a source, which is searched for and marked as such -
+see "How an extraction works".
+
+That division is the point of the record's shape. It is written against the Go
+API's `CuratedInput` rather than against what reads nicely off a web page, and
+every eligibility field is named after the profile field it becomes a rule on -
+so what comes out is something the matcher can evaluate rather than a paragraph
+nobody can match on.
 
 ## Setup
 
@@ -21,6 +31,23 @@ matcher evaluates instead of a paragraph nobody can match on.
 
 The key is `LLM_API_KEY`, not `GEMINI_API_KEY`. `.env.example` is the only list
 of variables that is checked against the code; everything below repeats it.
+
+Or as a container, which needs no Python and no browser install:
+
+    docker run --rm -p 8765:8765 --env-file .env <namespace>/sp-discovery:latest
+
+The image carries Chromium, so it is just under two gigabytes - `src/render.py` is
+tier 2 of the fetch path and not optional in practice, and an image without a
+browser can only read the easy half of the web. It runs unprivileged and binds
+every interface, which is how a container is reached at all; the rule about not
+exposing this to the internet is unchanged, and `DISCOVERY_VERIFY_URL` is what
+makes a reachable instance safe.
+
+`.github/workflows/ci.yml` builds it on every push and pull request, makes the
+built image render a page before trusting it, and publishes `:$GITHUB_SHA` and
+`:latest` from `main` only, through the protected `production` environment.
+A green run is not a deploy - the running container keeps serving whatever image
+it started with until something redeploys it.
 
 ## Two ways in
 
@@ -268,8 +295,9 @@ of the exception in `message`, and the run carries on to the next source.
 `report` on `item_done` carries `reused`, `grounded`, `pages_read`, `changes`,
 `reworded` and `corrections`.
 
-`GET /api/health` returns `ok`, `model`, `cache`, `max_items`, `schema_version`
-and `reason` - `ok` is false with a `reason` when `LLM_API_KEY` is unset.
+`GET /api/health` returns `ok`, `model`, `cache`, `max_items`, `schema_version`,
+`refresh_hours` and `reason` - `ok` is false with a `reason` when `LLM_API_KEY`
+is unset, and the service still starts and says so rather than refusing to boot.
 
 ## Environment
 
@@ -277,9 +305,10 @@ Everything is optional except the key. The full list, with the defaults the code
 actually uses, is in `.env.example`.
 
 ```env
-LLM_API_KEY=                          # required
-MODEL=                                # required
-REDIS_URL=redis://localhost:6379/0    # or REDIS_HOST / REDIS_PORT
+LLM_API_KEY=                          # the only required one
+
+MODEL=                                # the extraction model
+# REDIS_URL=redis://localhost:6379/0  # or REDIS_HOST / REDIS_PORT
 
 # SCHOLARSHIP_MAX_PAGES=5             # pages per extraction, including the seed
 # SCHOLARSHIP_MAX_STEPS=8             # tool-calling turns
@@ -287,9 +316,12 @@ REDIS_URL=redis://localhost:6379/0    # or REDIS_HOST / REDIS_PORT
 # SCHOLARSHIP_ALLOWED_DOMAINS=        # extra hosts it may open
 # SCHOLARSHIP_CLOSING_SOON_DAYS=7     # what --refresh calls "closing soon"
 
+# DISCOVERY_REFRESH_HOURS=24          # sweep watched pages this often; 0 is off
 # DISCOVERY_VERIFY_URL=               # check the caller against the API first
 # DISCOVERY_PATH_PREFIX=/discovery
 # DISCOVERY_ALLOWED_ORIGINS=          # only when the panel is not proxying
+
+# CHROMIUM_NO_SANDBOX=1               # only if a container refuses the sandbox
 ```
 
 ## Security
@@ -319,7 +351,8 @@ src/
   schema.py      the canonical record, written against CuratedInput
   normalise.py   API limits and vocabularies, and the corrections it reports
   cache.py       content-addressed Redis cache
-  watch.py       --refresh over watched pages
+  watch.py       one sweep over the watched pages, and what moved
+  sweeper.py     runs that sweep on a timer, and holds the last result
 ```
 
 Extraction lives in `agent.py`; there is no `extract.py` and no `models.py`.

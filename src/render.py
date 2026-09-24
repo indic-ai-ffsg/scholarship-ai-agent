@@ -9,6 +9,7 @@ rather than a `networkidle` race.
 """
 
 import logging
+import os
 
 from src.scrapers import FetchError
 
@@ -21,12 +22,12 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
 BLOCKED_RESOURCES = {"image", "font", "media"}
+BASE_ARGS = ["--disable-dev-shm-usage"]
 
 SETTLE_INTERVAL_MS = 250
 SETTLE_STABLE_SAMPLES = 2
 SETTLE_MIN_TEXT = 200
 SETTLE_MAX_MS = 15_000
-
 
 def render_html(url: str, timeout: float = DEFAULT_TIMEOUT) -> str:
     """Return `url`'s HTML after the page's JavaScript has run."""
@@ -41,7 +42,7 @@ def render_html(url: str, timeout: float = DEFAULT_TIMEOUT) -> str:
 
     try:
         with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=True)
+            browser = pw.chromium.launch(headless=True, args=_launch_args())
             try:
                 context = browser.new_context(
                     viewport=VIEWPORT,
@@ -62,6 +63,16 @@ def render_html(url: str, timeout: float = DEFAULT_TIMEOUT) -> str:
 
     log.info("Rendered %s (%d chars of HTML)", url, len(html))
     return html
+
+
+def _launch_args() -> list[str]:
+    args = list(BASE_ARGS)
+    if os.getenv("CHROMIUM_NO_SANDBOX", "").strip().lower() in ("1", "true", "yes"):
+        log.warning(
+            "CHROMIUM_NO_SANDBOX is set - Chromium will read pages with its sandbox off."
+        )
+        args.append("--no-sandbox")
+    return args
 
 
 def _block_heavy_resources(route, request) -> None:

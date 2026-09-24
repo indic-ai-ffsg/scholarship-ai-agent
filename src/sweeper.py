@@ -62,10 +62,6 @@ class Sweeper:
     """Runs the sweep on an interval, and holds the last result for the panel."""
 
     def __init__(self) -> None:
-        # Non-reentrant and never blocked on: a sweep that is already running is
-        # a reason to decline a second one, not to queue it. Two sweeps over the
-        # same watch list would re-fetch every page twice and race each other
-        # into the cache.
         self._running = threading.Lock()
         self._state_lock = threading.Lock()
         self._state: dict = {
@@ -118,16 +114,13 @@ class Sweeper:
             return
 
         if agent.cache is None or not agent.cache.enabled:
-            # The watch list lives in Redis. Without it there is nothing to
-            # sweep - not an error, just a service that was never going to have
-            # anything to re-check.
             log.info("No Redis, so nothing is watched - skipping the sweep.")
             self._store(reason, started, error="no cache, so nothing is watched")
             return
 
         try:
             events = refresh(agent)
-        except Exception as exc:                        # a sweep must not kill the thread
+        except Exception as exc:
             log.exception("Sweep failed")
             self._store(reason, started, error=f"{type(exc).__name__}: {exc}"[:300])
             return
@@ -135,9 +128,6 @@ class Sweeper:
         findings = []
         for event in events:
             row = asdict(event)
-            # The before/after of a change can be a whole who_qualifies object.
-            # The panel wants to know WHAT moved, and opens the draft to see the
-            # detail, so the values are shortened here rather than shipped whole.
             row["changes"] = [
                 {"field": name, "was": _short(was), "now": _short(now)}
                 for name, was, now in event.changes
@@ -179,10 +169,6 @@ class Sweeper:
         return hours
 
     def _loop(self, hours: float) -> None:
-        # Sleeps first. Sweeping on startup sounds helpful and is the wrong
-        # shape: a service that is restarting - a crash loop, a deploy, somebody
-        # iterating on the config - would sweep every time it came up, which is
-        # the one situation where the extra spend is least wanted.
         seconds = hours * 3600
         while True:
             time.sleep(seconds)

@@ -1,0 +1,181 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+
+  # ===========================================================================
+  # Stage 1 — check
+  # ===========================================================================
+
+  check:
+    name: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install
+        run: pip install -r requirements.txt
+
+      - name: Every module compiles
+        run: python -m compileall -q src main.py server.py
+
+      - name: Every module imports
+        run: |
+          python - <<'PY'
+          import importlib
+          for name in (
+              "src.agent", "src.cache", "src.fetcher", "src.normalise",
+              "src.render", "src.schema", "src.scrapers", "src.sweeper",
+              "src.tools", "src.watch", "server",
+          ):
+              importlib.import_module(name)
+              print("ok:", name)
+          PY
+
+      - name: The record schema still builds
+        run: |
+          python - <<'PY'
+          from src.schema import SCHEMA_VERSION, ScholarshipSchema
+          schema = ScholarshipSchema.model_json_schema()
+          fields = schema.get("properties", {})
+          assert fields, "the schema has no properties"
+          for required in ("name", "closes_at", "who_qualifies", "application_process"):
+              assert required in fields, f"schema lost {required}"
+          print(f"schema v{SCHEMA_VERSION}: {len(fields)} fields")
+          PY
+
+  # ===========================================================================
+  # Stage 2 — image
+  # ===========================================================================
+
+  image:
+    name: image
+    needs: check
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      IMAGE: ${{ vars.IMAGE_NAME || format('{0}/sp-discovery', secrets.DOCKER_USERNAME) }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          tags: ${{ env.IMAGE }}:${{ github.sha }}
+          load: true
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Runs unprivileged
+        run: |
+          who=$(docker run --rm "$IMAGE:$GITHUB_SHA" id -un)
+          echo "runs as: $who"
+          [ "$who" != "root" ] || { echo "the image runs as root"; exit 1; }
+
+      - name: Chromium is installed where the runtime user can reach it
+        run: |
+          docker run --rm "$IMAGE:$GITHUB_SHA" \
+            python -c "
+          from playwright.sync_api import sync_playwright
+          with sync_playwright() as pw:
+              path = pw.chromium.executable_path
+              print('chromium:', path)
+              import os, sys
+              sys.exit(0 if os.access(path, os.X_OK) else 1)
+          "
+
+      - name: The browser actually renders a page
+        run: |
+          docker run --rm "$IMAGE:$GITHUB_SHA" python -c "
+          from urllib.parse import quote
+          from src.render import render_html, _launch_args
+          print('launch args:', _launch_args())
+          body = '<h1>rendered</h1>' + '<p>the image can render a real page of text</p>' * 8
+          html = render_html('data:text/html,' + quote(body))
+          assert 'rendered' in html, html[:400]
+          print('rendered', len(html), 'chars')
+          "
+
+      - name: The service starts and answers
+        run: |
+          docker run -d --name discovery -p 8765:8765 "$IMAGE:$GITHUB_SHA"
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8765/api/health > /tmp/health.json 2>/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          echo "--- /api/health ---"; cat /tmp/health.json; echo
+          echo "--- container log ---"; docker logs discovery
+          docker rm -f discovery > /dev/null
+
+          # `ok` is false here on purpose: CI holds no Gemini key, and the
+          # service is meant to start and say so rather than refuse to boot.
+          # What is being checked is that it served a well-formed answer at all.
+          python -c "
+          import json
+          h = json.load(open('/tmp/health.json'))
+          for key in ('ok', 'model', 'cache', 'schema_version', 'refresh_hours'):
+              assert key in h, f'/api/health lost {key}: {h}'
+          print('health ok:', h)
+          "
+
+      - name: Automatic re-checking is off unless asked for
+        run: |
+          off=$(docker run --rm "$IMAGE:$GITHUB_SHA" \
+            python -c "from src.sweeper import interval_hours; print(interval_hours())")
+          echo "refresh interval with nothing set: $off"
+          [ "$off" = "0.0" ] || { echo "the image sweeps by default"; exit 1; }
+
+      # --- publish ------------------------------------------------------------
+
+      - name: Log in to Docker Hub
+        if: github.ref == 'refs/heads/main'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Push
+        if: github.ref == 'refs/heads/main'
+        run: |
+          set -o pipefail
+
+          # The commit tag is the one to deploy from — it names exactly one
+          # build. `latest` moves, which is convenient for a pull and useless
+          # for knowing what is running.
+          docker tag "$IMAGE:$GITHUB_SHA" "$IMAGE:latest"
+
+          if ! docker push "$IMAGE:$GITHUB_SHA"; then
+            echo "::error title=Push denied::The registry refused the write. The \
+          credentials authenticated, so the destination is what to check: the namespace \
+          must exist on Docker Hub and the account must be able to write to it. It \
+          defaults to DOCKER_USERNAME; set the repository variable IMAGE_NAME to \
+          'namespace/name' if the image belongs to an organisation instead. Also confirm \
+          DOCKER_PASSWORD is a token with Read & Write scope — a read-only token logs in \
+          successfully and then fails exactly like this."
+            exit 1
+          fi
+          docker push "$IMAGE:latest"

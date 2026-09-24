@@ -51,11 +51,6 @@ from src.schema import SCHEMA_VERSION, ScholarshipSchema
 from src.sweeper import sweeper
 
 log = logging.getLogger(__name__)
-
-# Where the panel mounts this service. Stripped from an incoming path when it
-# is there, so `/discovery/api/health` and `/api/health` are the same route:
-# nginx can pass $request_uri through untouched, which is the only form of
-# proxy_pass that survives an upstream address arriving as a variable.
 PATH_PREFIX = os.getenv("DISCOVERY_PATH_PREFIX", "/discovery").rstrip("/")
 
 VERIFY_URL = os.getenv("DISCOVERY_VERIFY_URL", "").strip()
@@ -314,8 +309,6 @@ class Handler(BaseHTTPRequestHandler):
             log.info("Run refused: the API answered %s.", exc.code)
             return False
         except (urllib.error.URLError, OSError) as exc:
-            # The API is unreachable. Refusing is the safe way to be wrong:
-            # this service reads arbitrary URLs and spends money doing it.
             log.warning("Could not check the caller with %s (%s) - refusing.", VERIFY_URL, exc)
             return False
 
@@ -423,7 +416,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(chunk)
                 self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
-            pass  # the tab was closed mid-run; the job carries on regardless
+            pass
 
     # --- plumbing --------------------------------------------------------
     def _body(self) -> dict | None:
