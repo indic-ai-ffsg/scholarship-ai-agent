@@ -66,3 +66,68 @@ def test_the_refusal_names_what_is_on_the_page(monkeypatch):
     message = str(caught.value)
     assert "separate sources" in message
     assert "AICTE Pragati" in message
+
+
+# --- the grounded half ------------------------------------------------------
+#
+# A URL that cannot be fetched is searched for instead, so there is no page to
+# count scheme names in. The record is the only evidence, and it turns out to be
+# enough: asked about a portal, the model says "portal".
+
+from src.agent import _PORTAL_MARKERS_NEEDED, _portal_markers
+
+ODISHA = {
+    "name": "Odisha State Scholarship Schemes",
+    "summary": "The Odisha State Scholarship Portal is an integrated single-window platform "
+               "offering multiple state government scholarship schemes",
+    "description": "an integrated online platform managed by the Government of Odisha that "
+                   "brings together scholarship schemes offered by various state departments",
+    "dates_text": "Different scholarship schemes hosted on the portal have individual timelines",
+    "opens_at": None, "closes_at": None,
+}
+
+UMBRELLA = {
+    "name": "Central Sector Umbrella Scheme Scholarships for Students with Disabilities",
+    "summary": "Government scholarships and fellowship schemes administered by DEPwD",
+    "description": "includes various programmes such as the National Fellowship for PwDs, "
+                   "National Overseas Scholarship Scheme, Free Coaching",
+    "dates_text": None, "opens_at": None, "closes_at": None,
+}
+
+REAL_SCHEME = {
+    "name": "SBI Platinum Jubilee Asha Scholarship 2026-27",
+    "summary": "financial aid between Rs 15,000 and Rs 15,00,000",
+    "description": "one of India's largest scholarship initiatives",
+    "dates_text": "New applications closed on 19 Sept 2026",
+    "opens_at": "2026-07-22", "closes_at": "2026-09-19",
+}
+
+
+def refused(record):
+    no_window = not record.get("opens_at") and not record.get("closes_at")
+    return no_window and len(_portal_markers(record)) >= _PORTAL_MARKERS_NEEDED
+
+
+def test_a_portal_that_states_no_dates_is_refused():
+    assert refused(ODISHA)
+
+
+def test_an_umbrella_scheme_is_not_a_portal():
+    """"Central Sector Umbrella Scheme" is a real named scheme that happens to
+    contain sub-schemes. It says "includes various programmes", never "portal",
+    and DEPwD's page for it should still produce a listing."""
+    assert _portal_markers(UMBRELLA) == []
+    assert not refused(UMBRELLA)
+
+
+def test_a_real_scheme_with_a_window_is_never_refused():
+    assert not refused(REAL_SCHEME)
+
+
+def test_portal_language_alone_is_not_enough():
+    """A scheme applied for THROUGH a portal still has its own dates, and the
+    dates are what tell the two apart."""
+    through_a_portal = dict(REAL_SCHEME, summary="Apply on the national portal, "
+                                                "a single-window platform for all schemes")
+    assert len(_portal_markers(through_a_portal)) >= _PORTAL_MARKERS_NEEDED
+    assert not refused(through_a_portal)

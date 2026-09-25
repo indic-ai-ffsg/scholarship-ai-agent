@@ -98,8 +98,29 @@ class CatalogueSource(RuntimeError):
     A refusal naming what is on the page costs the operator one more step and
     cannot put fiction in the catalogue.
     """
-    
+
 CATALOGUE_MIN_SCHEMES = 6
+
+_PORTAL_WORDS = (
+    "portal",
+    "single-window",
+    "single window",
+    "integrated platform",
+    "integrated online platform",
+    "online platform",
+    "brings together",
+    "hosted on the portal",
+)
+_PORTAL_MARKERS_NEEDED = 2
+
+
+def _portal_markers(record: dict) -> list[str]:
+    """Which portal words the record uses about itself."""
+    prose = " ".join(
+        str(record.get(field) or "")
+        for field in ("name", "summary", "description", "dates_text")
+    ).lower()
+    return [word for word in _PORTAL_WORDS if word in prose]
 
 
 @dataclass
@@ -196,6 +217,17 @@ class ScholarshipAgent:
             content = text
 
         result = self._extract(content, report.grounded)
+
+        if report.grounded:
+            markers = _portal_markers(result)
+            no_window = not result.get("opens_at") and not result.get("closes_at")
+            if no_window and len(markers) >= _PORTAL_MARKERS_NEEDED:
+                raise CatalogueSource(
+                    f"{text} is a portal listing several schemes, not one scholarship - "
+                    f"it describes itself as a {' / '.join(markers[:3])} and states no "
+                    "dates of its own. Search out the individual schemes and add those; "
+                    "the disability-specific one is usually named separately."
+                )
         report.corrections = normalise(result)
         for correction in report.corrections:
             log.info("Corrected: %s", correction)
