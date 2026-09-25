@@ -14,3 +14,4 @@ demo.py
 tests/
 conftest.py
 requirements-dev.txt
+commit-message.txt

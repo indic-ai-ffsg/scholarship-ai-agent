@@ -73,6 +73,8 @@ _RUN_CANCEL = re.compile(r"^/api/runs/([0-9a-f]{6,32})/cancel$")
 
 _cache_status = "unknown"
 
+_SCHEMA = ScholarshipSchema.model_json_schema()
+
 
 class Job:
     """One run over the list, and the event log the browser replays from."""
@@ -192,8 +194,6 @@ def _work(job: Job) -> None:
                     "pages_read": report.pages_read,
                     "reworded": report.reworded,
                     "changes": [name for name, _, _ in report.changes],
-                    # What had to be corrected to make the record postable. The
-                    # panel shows these beside the draft; see src/normalise.py.
                     "corrections": report.corrections,
                 },
             )
@@ -245,13 +245,10 @@ class Handler(BaseHTTPRequestHandler):
             })
         if path == "/api/health":
             return self._json(health())
-        # Read-only, and deliberately outside _permitted: it spends nothing, and
-        # a panel that cannot show "three deadlines moved last night" without a
-        # token is a panel that will not show it at all.
         if path == "/api/refresh":
             return self._json(sweeper.last())
         if path == "/api/schema":
-            return self._json(ScholarshipSchema.model_json_schema())
+            return self._json(_SCHEMA)
         if path == "/api/logo":
             return self._logo()
         match = _RUN_EVENTS.match(path)

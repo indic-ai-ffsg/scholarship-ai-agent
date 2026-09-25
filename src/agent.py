@@ -26,7 +26,7 @@ from src.cache import ResultCache
 from src.fetcher import fetch_page
 from src.normalise import normalise, parse_date
 from src.schema import SYSTEM_INSTRUCTION, ScholarshipSchema
-from src.scrapers import FetchError
+from src.scrapers import FetchError, scheme_names
 from src.tools import PageGatherer, declarations
 
 log = logging.getLogger(__name__)
@@ -81,6 +81,25 @@ Call finish_gathering as soon as no remaining link would fill a gap.
 
 class ExtractionError(RuntimeError):
     """The model answered, but not with a record we could parse."""
+
+
+class CatalogueSource(RuntimeError):
+    """The page lists many scholarships instead of describing one.
+
+    Refused rather than extracted, because the alternative is worse than a
+    failure. scholarships.gov.in/All-Scholarships carries thirty-nine schemes
+    with their own sponsors and their own windows, and asked for one record it
+    produced a plausible one: name "Schemes On NSP", sponsor "National
+    Scholarship Portal", opens_at taken from whichever scheme happened to be
+    first, closes_at null. Nothing in that draft is false-looking, and no
+    scholarship it describes exists. Saved, it is a listing students can apply
+    to that nobody runs.
+
+    A refusal naming what is on the page costs the operator one more step and
+    cannot put fiction in the catalogue.
+    """
+    
+CATALOGUE_MIN_SCHEMES = 6
 
 
 @dataclass
@@ -157,6 +176,17 @@ class ScholarshipAgent:
             if is_url and self.cache:
                 self.cache.watch(text)
             return cached, report
+
+        if seed is not None:
+            listed = scheme_names(seed.text)
+            if len(listed) >= CATALOGUE_MIN_SCHEMES:
+                shown = ", ".join(listed[:6])
+                raise CatalogueSource(
+                    f"This page lists {len(listed)} scholarships rather than describing one, "
+                    f"so there is no single record to extract from it. Add the schemes as "
+                    f"separate sources. It names: {shown}"
+                    + (", ..." if len(listed) > 6 else "")
+                )
 
         if report.grounded:
             content = _grounded_prompt(text, is_url)

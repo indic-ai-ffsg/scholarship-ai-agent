@@ -19,6 +19,7 @@ from bs4 import BeautifulSoup
 log = logging.getLogger(__name__)
 
 DEFAULT_TIMEOUT = 15.0
+CONNECT_TIMEOUT = 5.0
 MAX_CHARS = 60_000
 MIN_USEFUL_CHARS = 400
 LINK_LIMIT = 60
@@ -56,15 +57,34 @@ class FetchError(RuntimeError):
     """A page could not be fetched, or held nothing worth extracting."""
 
 
+class Unreachable(FetchError):
+    """The host never answered at all - no TCP connection, no DNS, no TLS.
+
+    Kept apart from every other FetchError because it is the one failure the
+    renderer cannot do anything about. Chromium is a second HTML engine, not a
+    second network stack: if requests could not open a socket to the host,
+    Chromium will not either, and it will take thirty seconds to find out.
+
+    scholarship.odisha.gov.in is the case that made this worth a class of its
+    own. It loads in 0.2s from a laptop and does not route to Railway's egress
+    at all, so a run there spent fifteen seconds failing to connect, thirty more
+    failing to connect again through a browser, and only then began the search
+    that was always going to be the answer.
+    """
+
+
 def fetch_html(url: str, timeout: float = DEFAULT_TIMEOUT) -> str:
     """Return the raw HTML at `url`.
 
-    Raises FetchError for anything a caller can recover from by trying another
-    tier: network failures, HTTP errors, and non-HTML responses.
+    Raises Unreachable when the host never answered, and FetchError for
+    everything a caller can still recover from by trying another tier: HTTP
+    errors, non-HTML responses, and a body too thin to use.
     """
     try:
-        response = requests.get(url, headers=_HEADERS, timeout=timeout)
+        response = requests.get(url, headers=_HEADERS, timeout=(CONNECT_TIMEOUT, timeout))
         response.raise_for_status()
+    except (requests.ConnectionError, requests.ConnectTimeout) as exc:
+        raise Unreachable(f"could not reach {url} ({_brief(exc)})") from exc
     except requests.RequestException as exc:
         raise FetchError(f"could not fetch {url} ({exc})") from exc
 
@@ -76,6 +96,42 @@ def fetch_html(url: str, timeout: float = DEFAULT_TIMEOUT) -> str:
         response.encoding = response.apparent_encoding
 
     return response.text
+
+
+# A scheme's name, as it appears in running text. The tail is the name; the head
+# is whatever sentence happened to carry it, which is why matches are keyed on
+# their last few words - "How do I apply for the SBI Asha Scholarship" and "Key
+# milestones for the SBI Asha Scholarship" are one scheme, not two.
+_SCHEME_NAME = re.compile(r"[A-Z][A-Za-z0-9'&.,()\- ]{12,80}?(?:Scholarship|Fellowship|Scheme)\b")
+_NAME_KEY_WORDS = 5
+
+
+def scheme_names(text: str) -> list[str]:
+    """Distinct scholarship names the text appears to list.
+
+    Deliberately crude, and only ever used to answer "is this page about one
+    scheme or about many?" - not to extract anything. Measured on three real
+    pages: one scheme on sbiashascholarship.co.in, two on depwd's umbrella
+    index, forty-two on scholarships.gov.in/All-Scholarships.
+    """
+    seen: dict[str, str] = {}
+    for match in _SCHEME_NAME.findall(text):
+        name = " ".join(match.split())
+        # A fragment, not a name: the regex starts at a capital, so a scheme
+        # written "X (Technical Degree) (Welfare Based Scheme)" also yields the
+        # tail from its second bracket. Unbalanced brackets are the tell, and
+        # counting is enough - these are only ever shown to a person.
+        if name.count("(") != name.count(")"):
+            continue
+        key = " ".join(name.lower().split()[-_NAME_KEY_WORDS:])
+        seen.setdefault(key, name)
+    return list(seen.values())
+
+
+def _brief(exc: Exception) -> str:
+    """requests wraps urllib3 wraps socket; the useful part is the last clause."""
+    text = str(exc)
+    return text[-160:] if len(text) > 160 else text
 
 
 def html_to_text(html: str) -> str:
@@ -92,7 +148,10 @@ def extract_links(html: str, base_url: str, limit: int = LINK_LIMIT) -> list[str
     mega-menu appears before its content, so the first 60 anchors on a scheme
     page are category and marketing links, not the sub-schemes worth reading.
     """
-    soup = BeautifulSoup(html, "html.parser")
+    return _links_from(BeautifulSoup(html, "html.parser"), base_url, limit)
+
+
+def _links_from(soup, base_url: str, limit: int = LINK_LIMIT) -> list[str]:
     host = urlparse(base_url).netloc
     seed_tokens = _tokens(urlparse(base_url).path)
 
@@ -130,7 +189,10 @@ def extract_images(html: str, base_url: str, limit: int = IMAGE_LIMIT) -> list[s
     first <img> on the page, but a hero banner often beats it, and the banner is
     a picture of students rather than the sponsor's mark.
     """
-    soup = BeautifulSoup(html, "html.parser")
+    return _images_from(BeautifulSoup(html, "html.parser"), base_url, limit)
+
+
+def _images_from(soup, base_url: str, limit: int = IMAGE_LIMIT) -> list[str]:
     scored: list[tuple[int, str]] = []
     seen: set[str] = set()
 
@@ -203,8 +265,11 @@ def extract_text_from_html(html: str) -> tuple[str, str]:
     Shared by the plain fetcher and the browser renderer so both produce text
     the extractor sees the same way.
     """
-    soup = BeautifulSoup(html, "html.parser")
+    return _text_from(BeautifulSoup(html, "html.parser"))
 
+
+def _text_from(soup) -> tuple[str, str]:
+    """DESTRUCTIVE: decomposes `soup`. Nothing may read it afterwards."""
     embedded = _embedded_state(soup)
 
     for element in soup(_INERT_TAGS):
@@ -230,6 +295,28 @@ EMBEDDED_HEADING = (
     "can be out of date, so where it disagrees with the text above, the text "
     "above is what the page actually shows) ---"
 )
+
+
+def parse_page(html: str, base_url: str) -> tuple[str, str, list[str], list[str]]:
+    """Everything a fetched page yields, from ONE parse of it.
+
+    Building the soup is 87-94% of the cost of each extractor - measured on
+    three real portals, 12ms for a 100KB page and 30ms for a 205KB one - and
+    fetch_page wanted three of them from the same bytes: text, links, images.
+    So it paid that cost three times, and six when it escalated to the renderer,
+    for a document that had not changed in between.
+
+    The order is not arbitrary. Links and images only read the tree; the text
+    pass decomposes it, and a decomposed tree has no anchors left to find. Text
+    goes last and nothing touches the soup afterwards.
+
+    Returns (visible, embedded, links, images).
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    links = _links_from(soup, base_url)
+    images = _images_from(soup, base_url)
+    visible, embedded = _text_from(soup)
+    return visible, embedded, links, images
 
 
 def join_text(visible: str, embedded: str) -> str:

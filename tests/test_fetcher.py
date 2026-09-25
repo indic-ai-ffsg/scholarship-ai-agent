@@ -79,3 +79,34 @@ def test_a_page_that_yields_nothing_raises(no_network):
     no_network["render"] = page(visible="tiny", links=[])
     with pytest.raises(FetchError):
         fetcher.fetch_page("https://sponsor.example/empty")
+
+
+def test_an_unreachable_host_does_not_wake_the_renderer(monkeypatch):
+    """Chromium is a second HTML engine, not a second network stack.
+
+    scholarship.odisha.gov.in does not route to Railway's egress. A run there
+    spent 15s failing to connect, 30s failing to connect again through a
+    browser, and only then started the search that was always the answer.
+    """
+    from src.scrapers import Unreachable
+
+    rendered = []
+    monkeypatch.setattr(fetcher, "fetch_html",
+                        lambda url, timeout=None: (_ for _ in ()).throw(Unreachable("no route")))
+    monkeypatch.setattr("src.render.render_html",
+                        lambda url, timeout=None: rendered.append(url) or "<html></html>")
+
+    with pytest.raises(Unreachable):
+        fetcher.fetch_page("https://unreachable.example/scheme")
+    assert rendered == [], "the renderer was called for a host that never answered"
+
+
+def test_an_http_error_still_gets_the_renderer(no_network):
+    """A host that answers 403 to requests may well serve a real browser, and a
+    200 with an empty shell is exactly what tier 2 is for. Only a dead socket
+    skips it."""
+    no_network["plain"] = None                       # raises plain FetchError
+    no_network["render"] = page(visible=PROSE, links=[("Apply", "/apply")])
+    got = fetcher.fetch_page("https://picky.example/scheme")
+    assert no_network["rendered"] == 1
+    assert got.tier == "render"

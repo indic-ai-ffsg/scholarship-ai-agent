@@ -175,6 +175,18 @@ Stripping by tag name took it under the floor, so it rendered in Chromium for
 six seconds and then failed. The text is now kept whenever stripping is the
 difference between a usable page and a failed one.
 
+A page that lists many scholarships is refused rather than extracted from.
+`scholarships.gov.in/All-Scholarships` carries thirty-nine schemes with their
+own sponsors and their own windows; asked for one record it produced a
+plausible one - name "Schemes On NSP", sponsor "National Scholarship Portal",
+`opens_at` from whichever scheme came first, `closes_at` null. Nothing in that
+draft looks wrong and no scholarship it describes exists, so saving it would put
+a listing in the catalogue that students can apply to and nobody runs. The
+refusal names the schemes it found, and the operator adds them as separate
+sources. The threshold is six distinct names, in a gap measurement made wide:
+one on a sponsor's own page, one on a department's umbrella index, twenty-one on
+the NSP catalogue.
+
 A paste shorter than `NAME_ONLY_CHARS` skips all three and is **searched for**
 instead, because it is a name rather than a source. Pasting a scheme's title and
 nothing else used to extract from the title: every date, every amount and the

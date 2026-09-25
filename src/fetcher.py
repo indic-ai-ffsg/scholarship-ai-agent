@@ -13,12 +13,10 @@ from src.scrapers import (
     MAX_CHARS,
     MIN_USEFUL_CHARS,
     FetchError,
-    extract_images,
-    extract_links,
-    extract_text_from_html,
+    Unreachable,
     fetch_html,
-    html_to_text,
     join_text,
+    parse_page,
 )
 
 log = logging.getLogger(__name__)
@@ -39,16 +37,17 @@ class Page:
 def fetch_page(url: str, max_chars: int = MAX_CHARS) -> Page:
     """Return `url` as text plus navigable links, escalating tiers as needed."""
     html, tier = "", "fetch"
-    visible = ""
+    visible, images = "", []
     try:
         html = fetch_html(url)
-        visible, embedded = extract_text_from_html(html)
+        visible, embedded, links, images = parse_page(html, url)
         text = join_text(visible, embedded)
+    except Unreachable as exc:
+        log.warning("%s", exc)
+        raise
     except FetchError as exc:
         log.warning("Plain fetch fell short - %s", exc)
-        text = ""
-
-    links = extract_links(html, url) if html else []
+        text, links = "", []
     if len(visible) < MIN_USEFUL_CHARS or not links:
         if html:
             log.info(
@@ -60,13 +59,12 @@ def fetch_page(url: str, max_chars: int = MAX_CHARS) -> Page:
         from src.render import render_html
 
         rendered = render_html(url)
-        rendered_visible, rendered_embedded = extract_text_from_html(rendered)
+        rendered_visible, rendered_embedded, rendered_links, rendered_images = parse_page(rendered, url)
         rendered_text = join_text(rendered_visible, rendered_embedded)
-        rendered_links = extract_links(rendered, url)
         
         if len(rendered_visible) > len(visible) or len(rendered_links) > len(links):
             html, text, links, tier = rendered, rendered_text, rendered_links, "render"
-            visible = rendered_visible
+            visible, images = rendered_visible, rendered_images
 
         if len(text) < MIN_USEFUL_CHARS:
             raise FetchError(
@@ -78,7 +76,7 @@ def fetch_page(url: str, max_chars: int = MAX_CHARS) -> Page:
         url=url,
         text=text[:max_chars],
         links=links,
-        images=extract_images(html, url),
+        images=images,
         tier=tier,
     )
     log.info("Read %s", page.summary())
