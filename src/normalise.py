@@ -357,7 +357,7 @@ def _contacts(record: dict, notes: list[str]) -> None:
             continue
 
         if kind in ("PHONE", "WHATSAPP"):
-            dialled = _phone(value)
+            dialled = _phone(value, kind)
             if dialled is None:
                 named = str(_plain(entry.get("label")) or "").strip()
                 _append_note(
@@ -365,12 +365,12 @@ def _contacts(record: dict, notes: list[str]) -> None:
                     f"Contact as given: {named + ': ' if named else ''}{value}",
                 )
                 notes.append(
-                    f"{value!r} is not a ten-digit Indian number, which is all the listing can "
-                    "hold - moved into the notes."
+                    f"{value!r} is not a number the listing can hold (ten digits, a toll-free "
+                    "1800 / 1860 line, or a short helpline) - moved into the notes."
                 )
                 continue
             if dialled != value:
-                notes.append(f"{value!r} was written as {dialled} - the column takes the ten digits.")
+                notes.append(f"{value!r} was written as {dialled} - the column takes the digits.")
                 value = dialled
 
         key = (kind, value.lower())
@@ -391,7 +391,7 @@ def _contacts(record: dict, notes: list[str]) -> None:
     record["contacts"] = cleaned
 
 
-def _phone(value: str) -> str | None:
+def _phone(value: str, kind: str = "PHONE") -> str | None:
     """The number as `validateContacts` will count it, or None.
 
     The API's rule is ten digits once everything else is stripped - every Indian
@@ -401,11 +401,15 @@ def _phone(value: str) -> str | None:
       +91 98765 43210   thirteen characters, ten digits once the country code
                         goes. Rewritten, because the number is right and only
                         the way it is written is not.
-      1800 11 8004      a toll-free helpline. Eleven digits, and no amount of
-                        rewriting makes it ten - it is a real number that this
-                        column cannot hold. The caller moves it into the notes
-                        rather than dropping it, because it is often the only
-                        number on the page.
+      1800 11 8004      a toll-free helpline. Eleven digits. The API took only
+                        ten until 2026-09-29, so this went into the notes - and
+                        an operator who wanted it as a contact padded a short
+                        helpline to ten digits to get it saved, which is a
+                        number that rings nowhere. The API now takes toll-free
+                        1800 / 1860 lines and short helplines (155335) for a
+                        PHONE (registry.phoneProblem), so they are kept as
+                        contacts. A WHATSAPP number is still ten digits: it is
+                        a mobile.
 
     A value that already passes is returned untouched, spacing and all: the
     sponsor wrote it that way and the API does not mind.
@@ -420,6 +424,11 @@ def _phone(value: str) -> str | None:
         return digits[1:]
     if len(digits) == 13 and digits.startswith("091"):
         return digits[3:]
+    if kind == "PHONE":
+        if len(digits) == 11 and digits.startswith(("1800", "1860")):
+            return digits
+        if 3 <= len(digits) <= 6 and digits.startswith("1"):
+            return digits
     return None
 
 
