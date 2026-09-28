@@ -45,6 +45,7 @@ from google.genai import errors as genai_errors
 
 import requests
 
+from src import search
 from src.agent import DEFAULT_MODEL, ScholarshipAgent
 from src.cache import ResultCache
 from src.schema import SCHEMA_VERSION, ScholarshipSchema
@@ -239,7 +240,7 @@ class Handler(BaseHTTPRequestHandler):
                 "service": "scholarship discovery",
                 "ui": "the admin panel, under Discovery",
                 "routes": [
-                    "/api/health", "/api/schema", "/api/runs",
+                    "/api/health", "/api/schema", "/api/search", "/api/runs",
                     "/api/runs/<id>/events", "/api/refresh",
                 ],
             })
@@ -265,6 +266,8 @@ class Handler(BaseHTTPRequestHandler):
             )
         if path == "/api/runs":
             return self._create_run()
+        if path == "/api/search":
+            return self._search()
         if path == "/api/refresh":
             started = sweeper.start_in_background(reason="asked for")
             return self._json({"started": started, "running": True}, status=202)
@@ -334,6 +337,45 @@ class Handler(BaseHTTPRequestHandler):
                               status=400)
         job = start_job(items, use_cache=bool(body.get("use_cache", True)))
         self._json({"job_id": job.id, "count": len(items)}, status=202)
+
+    def _search(self) -> None:
+        """Find schemes on a topic, for the operator to choose which to read.
+
+        Synchronous, unlike a run: one grounded call, ten to thirty seconds,
+        and nothing to narrate in the meantime. It returns candidates and
+        starts nothing - the panel adds the ones somebody ticks to the ordinary
+        run, which is where reading, the catalogue refusal and the draft all
+        happen. See src/search.py for why the two steps are kept apart.
+        """
+        body = self._body()
+        if body is None:
+            return
+        topic = body.get("topic") if isinstance(body.get("topic"), str) else ""
+        limit = body.get("limit") if isinstance(body.get("limit"), int) else 12
+
+        try:
+            agent = ScholarshipAgent(use_cache=False)
+        except ValueError as exc:
+            return self._json({"error": str(exc)}, status=503)
+
+        started = time.time()
+        try:
+            found = search.find(agent.client, agent.model_name, topic, limit)
+        except search.SearchError as exc:
+            log.warning("Search gave nothing usable: %s", exc)
+            return self._json(
+                {"error": "The search came back without a usable list. Try a narrower topic."},
+                status=502,
+            )
+        except genai_errors.APIError as exc:
+            return self._json({"error": f"The model could not search: {_first_line(exc)}"},
+                              status=502)
+
+        self._json({
+            "topic": topic.strip() or search.DEFAULT_TOPIC,
+            "candidates": found,
+            "seconds": round(time.time() - started, 1),
+        })
 
     def _logo(self) -> None:
         """Fetch a sponsor's mark, so the panel can attach it to a draft.

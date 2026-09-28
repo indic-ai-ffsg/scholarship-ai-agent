@@ -204,8 +204,9 @@ class ScholarshipAgent:
                 shown = ", ".join(listed[:6])
                 raise CatalogueSource(
                     f"This page lists {len(listed)} scholarships rather than describing one, "
-                    f"so there is no single record to extract from it. Add the schemes as "
-                    f"separate sources. It names: {shown}"
+                    f"so there is no single record to extract from it. Use Find scholarships "
+                    f"to list the schemes one by one, or add them as separate sources. "
+                    f"It names: {shown}"
                     + (", ..." if len(listed) > 6 else "")
                 )
 
@@ -225,8 +226,8 @@ class ScholarshipAgent:
                 raise CatalogueSource(
                     f"{text} is a portal listing several schemes, not one scholarship - "
                     f"it describes itself as a {' / '.join(markers[:3])} and states no "
-                    "dates of its own. Search out the individual schemes and add those; "
-                    "the disability-specific one is usually named separately."
+                    "dates of its own. Use Find scholarships to list its individual schemes "
+                    "and read those; the disability-specific one is usually named separately."
                 )
         report.corrections = normalise(result)
         for correction in report.corrections:
