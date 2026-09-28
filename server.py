@@ -170,7 +170,7 @@ def _work(job: Job) -> None:
             job.emit("item_start", index=index)
             started = time.time()
             try:
-                record, report = agent.run(item, reuse=job.use_cache)
+                record, report = agent.run(item, reuse=job.use_cache, for_draft=True)
             except (ValueError, RuntimeError, genai_errors.APIError) as exc:
                 job.emit(
                     "item_error", index=index,
@@ -360,7 +360,7 @@ class Handler(BaseHTTPRequestHandler):
 
         started = time.time()
         try:
-            found = search.find(agent.client, agent.model_name, topic, limit)
+            found, dropped = search.find(agent.client, agent.model_name, topic, limit)
         except search.SearchError as exc:
             log.warning("Search gave nothing usable: %s", exc)
             return self._json(
@@ -374,6 +374,9 @@ class Handler(BaseHTTPRequestHandler):
         self._json({
             "topic": topic.strip() or search.DEFAULT_TOPIC,
             "candidates": found,
+            # Said rather than silently subtracted: "8 found, 4 left out
+            # because they had closed" is a different answer from "8 found".
+            "left_out": dropped,
             "seconds": round(time.time() - started, 1),
         })
 

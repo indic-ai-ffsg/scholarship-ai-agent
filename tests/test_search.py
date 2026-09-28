@@ -76,3 +76,91 @@ def test_the_prompt_refuses_portals_and_guessed_addresses():
     prompt = _prompt(DEFAULT_TOPIC, 10)
     assert "Never an entry for a portal" in prompt
     assert "Never construct or guess an address" in prompt
+
+
+# --- vetting: the three failures of the first live run (2026-09-28) ----------
+
+from datetime import date
+
+from src.search import vet
+
+TODAY = date(2026, 9, 29)
+
+
+def _web(answers):
+    """A stand-in for the web: address -> "ok" / "missing" / "unreadable"."""
+    return lambda url: answers.get(url, "ok")
+
+
+def test_a_scheme_that_has_closed_is_left_out():
+    closed = {**GOOD, "name": "National Overseas Scholarship for ST Candidates",
+              "url": "https://overseas.tribal.gov.in/scheme", "closes_at": "2026-07-31"}
+    kept, dropped = vet([closed], [], TODAY, probe=_web({}))
+    assert kept == []
+    assert "closed on 31 July 2026" in dropped[0]
+
+
+def test_a_scheme_with_no_closing_date_is_kept():
+    # "Not stated" is not "closed".
+    kept, _ = vet([{**GOOD, "closes_at": None}], [], TODAY, probe=_web({}))
+    assert len(kept) == 1
+
+
+def test_a_portal_home_page_is_left_out():
+    rows = [
+        {**GOOD, "name": "National Scholarship Portal Schemes", "url": "https://scholarships.gov.in/"},
+        {**GOOD, "name": "National Overseas Scholarship", "url": "https://tribal.nic.in/"},
+    ]
+    kept, dropped = vet(rows, [], TODAY, probe=_web({}))
+    assert kept == []
+    assert len(dropped) == 2
+
+
+def test_a_sponsors_own_single_scheme_site_is_not_a_portal():
+    # sbiashascholarship.co.in/ is a bare home page AND the scheme.
+    kept, _ = vet([GOOD], [], TODAY, probe=_web({}))
+    assert kept[0]["url"] == GOOD["url"]
+
+
+def test_an_invented_address_is_replaced_by_the_real_search_result():
+    invented = {**GOOD, "name": "National Means-cum-Merit Scholarship Scheme (NMMSS)",
+                "url": "https://www.education.gov.in/en/nmms", "closes_at": None}
+    real = "https://scholarships.gov.in/public/schemeGuidelines/NMMSS.pdf"
+    links = [("NMMSS - National Means-cum-Merit Scholarship guidelines", real)]
+    kept, _ = vet([invented], links, TODAY, probe=_web({invented["url"]: "missing"}))
+    assert kept[0]["url"] == real
+
+
+def test_an_invented_address_with_no_real_result_is_left_out():
+    invented = {**GOOD, "url": "https://www.education.gov.in/en/made-up"}
+    kept, dropped = vet([invented], [], TODAY, probe=_web({invented["url"]: "missing"}))
+    assert kept == []
+    assert "does not exist" in dropped[0]
+
+
+def test_a_page_that_cannot_be_read_is_offered_but_marked():
+    # education.gov.in: a real address, an empty shell to a request and "Access
+    # Denied" to a browser. Not a wrong address, so not dropped - but offered
+    # unticked, because its draft could only come from a search.
+    blocked = {**GOOD, "url": "https://www.education.gov.in/en/nmms"}
+    kept, _ = vet([blocked], [], TODAY, probe=_web({blocked["url"]: "unreadable"}))
+    assert kept[0]["readable"] is False
+
+
+def test_an_unreadable_page_is_swapped_for_a_readable_result_about_the_same_scheme():
+    blocked = {**GOOD, "name": "Central Sector Scheme of Scholarship for College and University Students",
+               "url": "https://www.education.gov.in/en/central-sector-scheme-scholarship-college-and-university-students"}
+    other = "https://example.org/central-sector-scheme-college-university-students-2026"
+    unrelated = "https://example.org/pragati-scholarship"
+    links = [("AICTE Pragati Scholarship", unrelated),
+             ("Central Sector Scheme of Scholarship for College and University Students 2026", other)]
+    kept, _ = vet([blocked], links, TODAY, probe=_web({blocked["url"]: "unreadable"}))
+    assert kept[0]["url"] == other
+    assert kept[0]["readable"] is True
+
+
+def test_readable_candidates_come_first():
+    a = {**GOOD, "name": "Blocked scheme", "url": "https://blocked.example.org/a"}
+    b = {**GOOD, "name": "Open scheme", "url": "https://open.example.org/b"}
+    kept, _ = vet([a, b], [], TODAY, probe=_web({a["url"]: "unreadable"}))
+    assert [c["name"] for c in kept] == ["Open scheme", "Blocked scheme"]

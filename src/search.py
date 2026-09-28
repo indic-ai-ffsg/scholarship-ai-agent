@@ -31,6 +31,27 @@ The URL rule is enforced here as well as asked for: anything that is not an
 http(s) address is dropped, and duplicates of the same page or the same name
 are merged, because a model asked for fifteen results will happily return the
 same scheme three times under three spellings.
+
+Asking was not enough, and the first live run on 2026-09-28 showed it three
+ways, which is why `vet` exists:
+
+  * Pages that cannot be read. education.gov.in answers a plain request with
+    an empty app shell and a 200, and a browser with Akamai's "Access Denied" -
+    so its scheme pages are real addresses that the extractor cannot read, and
+    each came back as "From a search, not the page". Asking the model for good
+    addresses cannot fix that; only trying to read them can. So every candidate
+    is read the way a run would read it (fetch_page) before it is offered. One
+    that cannot be read is swapped for another real search result about the
+    same scheme that can (the grounding links are the pages the search actually
+    returned), and where there is none it is offered UNticked and marked, so
+    choosing a search-built draft is a decision rather than a surprise. A 404 or
+    410 is a wrong address outright and is dropped when there is no swap.
+  * A portal's home page. scholarships.gov.in/ and tribal.nic.in/ are a list of
+    schemes and a ministry, not a scheme. A government site's bare home page is
+    never one scheme's page, so it is dropped here rather than refused later.
+  * Closed schemes. The National Overseas Scholarship closed on 31 July and was
+    offered in September. A candidate whose closing date has passed is dropped;
+    one with no date stays, because "not stated" is not "closed".
 """
 
 import json
@@ -40,8 +61,14 @@ from dataclasses import asdict, dataclass
 from datetime import date
 from urllib.parse import urlparse
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import TimeoutError as FuturesTimeout
+
 import requests
 from google.genai import types
+
+from src.fetcher import fetch_page
+from src.scrapers import FetchError
 
 log = logging.getLogger(__name__)
 
@@ -52,6 +79,26 @@ DEFAULT_TOPIC = (
 MAX_RESULTS = 20
 MAX_TOPIC_CHARS = 300
 RESOLVE_TIMEOUT = 5.0
+CHECK_TIMEOUT = 8.0
+# Reading a candidate can mean launching Chromium, so they are read a few at a
+# time and the whole check is capped. A candidate still being read at the cap is
+# offered as unconfirmed rather than holding the answer up - the proxy allows
+# ten minutes, but the operator is watching a spinner.
+PROBE_WORKERS = 4
+PROBE_DEADLINE = 50.0
+
+# Status codes that mean the ADDRESS is wrong rather than that the site is
+# slow or unwelcoming to a server. Only these drop a candidate: a timeout or a
+# 403 from a government host is how some of them answer anything that is not a
+# browser, and the extractor has a search fallback for exactly that.
+_WRONG_ADDRESS = (404, 410)
+
+# A bare home page on one of these is a department or a portal, never one
+# scheme. A sponsor's own single-scheme site (sbiashascholarship.co.in) is a
+# bare home page too and is the scheme, which is why this is a list of hosts
+# rather than a rule about every root URL.
+_PORTAL_SUFFIXES = (".gov.in", ".nic.in", "buddy4study.com", "vidyasaarathi.co.in")
+_PORTAL_NAME = re.compile(r"\b(portal|schemes)\b", re.IGNORECASE)
 
 # Search results often come back as Google's own redirect links. They work, but
 # a draft whose source is vertexaisearch.cloud.google.com is unreadable to the
@@ -75,10 +122,19 @@ class Candidate:
     sponsor: str | None = None
     closes_at: str | None = None
     note: str | None = None
+    # False when the page could not be read the way a run reads it - blocked,
+    # empty, or not answering. Offered unticked: reading it will fall back to a
+    # search, which is weaker, and the operator should choose that knowingly.
+    readable: bool = True
 
 
-def find(client, model: str, topic: str | None = None, limit: int = 12) -> list[dict]:
-    """Search for individual schemes on a topic and return them as candidates."""
+def find(client, model: str, topic: str | None = None, limit: int = 12) -> tuple[list[dict], list[str]]:
+    """Search for individual schemes on a topic.
+
+    Returns the candidates worth offering and, for the ones that were not, one
+    line each saying why - so the screen can say "3 left out: closed" rather
+    than quietly showing fewer than were asked for.
+    """
     topic = (topic or "").strip()[:MAX_TOPIC_CHARS] or DEFAULT_TOPIC
     limit = max(1, min(int(limit or 12), MAX_RESULTS))
 
@@ -95,13 +151,130 @@ def find(client, model: str, topic: str | None = None, limit: int = 12) -> list[
     )
 
     text = getattr(response, "text", None) or ""
-    candidates = parse(text)[:limit]
-    for candidate in candidates:
-        candidate["url"] = resolve(candidate["url"])
-    candidates = _dedupe(candidates)
+    candidates, dropped = vet(parse(text), grounding_links(response), date.today())
+    candidates = candidates[:limit]
 
-    log.info("Found %d scheme(s).", len(candidates))
-    return candidates
+    log.info("Found %d scheme(s); left out %d.", len(candidates), len(dropped))
+    for why in dropped:
+        log.info("Left out: %s", why)
+    return candidates, dropped
+
+
+def vet(candidates: list[dict], links: list[tuple[str, str]], today: date,
+        probe=None) -> tuple[list[dict], list[str]]:
+    """Keep what is open, is one scheme, and can actually be read.
+
+    `probe(url)` answers "ok", "missing" (404/410) or "unreadable"; it is a
+    parameter so the tests can say what the web would have said. The cheap rules
+    run first, so nothing is fetched for a scheme that has closed.
+    """
+    probe = probe or _probe
+    kept: list[dict] = []
+    dropped: list[str] = []
+
+    pending: list[dict] = []
+    for c in candidates:
+        closes = _date(c.get("closes_at"))
+        if closes and closes < today:
+            dropped.append(f"{c['name']} - closed on {closes:%d %B %Y}")
+            continue
+        c["url"] = resolve(c["url"])
+        if _is_portal(c["name"], c["url"]):
+            dropped.append(f"{c['name']} - {c['url']} lists many schemes, not one")
+            continue
+        pending.append(c)
+
+    verdicts = _probe_all([c["url"] for c in pending], probe)
+    for c in pending:
+        verdict = verdicts.get(c["url"], "unreadable")
+        if verdict != "ok":
+            better = _match(c["name"], links, probe, avoid=c["url"])
+            if better:
+                log.info("Swapped %s (%s) for %s from the search results.", c["url"], verdict, better)
+                c["url"], verdict = better, "ok"
+        if verdict == "missing":
+            dropped.append(f"{c['name']} - its address does not exist "
+                           "and the search had no other page for it")
+            continue
+        c["readable"] = verdict == "ok"
+        kept.append(c)
+
+    # Readable first: they are the ones worth ticking.
+    kept.sort(key=lambda c: not c["readable"])
+    return _dedupe(kept), dropped
+
+
+def _probe_all(urls: list[str], probe) -> dict[str, str]:
+    """Probe several addresses at once, within PROBE_DEADLINE."""
+    out: dict[str, str] = {}
+    if not urls:
+        return out
+    pool = ThreadPoolExecutor(max_workers=PROBE_WORKERS)
+    futures = {pool.submit(probe, u): u for u in urls}
+    try:
+        for done in as_completed(futures, timeout=PROBE_DEADLINE):
+            try:
+                out[futures[done]] = done.result()
+            except Exception:
+                out[futures[done]] = "unreadable"
+    except FuturesTimeout:
+        log.info("Stopped checking pages after %ss; the rest are offered unconfirmed.", PROBE_DEADLINE)
+    pool.shutdown(wait=False, cancel_futures=True)
+    return out
+
+
+def _probe(url: str) -> str:
+    """Read an address the way a run will, and say how it went."""
+    status = _status(url)
+    if status in _WRONG_ADDRESS:
+        return "missing"
+    try:
+        fetch_page(url)
+    except FetchError as exc:
+        log.info("Cannot read %s: %s", url, exc)
+        return "unreadable"
+    return "ok"
+
+
+def grounding_links(response) -> list[tuple[str, str]]:
+    """The pages the search actually returned, as (title, address).
+
+    These are real results, unlike an address the model writes into its answer,
+    so they are what an unreadable address is swapped from. Missing metadata is
+    an empty list, not an error: it is a better-if-present, not a requirement.
+    """
+    out: list[tuple[str, str]] = []
+    try:
+        chunks = response.candidates[0].grounding_metadata.grounding_chunks or []
+    except (AttributeError, IndexError, TypeError):
+        return out
+    for chunk in chunks:
+        web = getattr(chunk, "web", None)
+        uri = getattr(web, "uri", None)
+        if uri:
+            out.append((getattr(web, "title", "") or "", uri))
+    return out
+
+
+def _match(name: str, links: list[tuple[str, str]], probe, avoid: str = "") -> str | None:
+    """A search result that is plainly about this scheme and can be read, if any.
+
+    Plainly means most of the scheme's distinctive words are in the result's
+    title - not a similarity score, because a near miss here is a different
+    scheme's page under this one's name, which is the error being fixed.
+    """
+    words = _words(name)
+    if not words:
+        return None
+    for title, uri in links:
+        if len(words & _words(title)) < max(2, (len(words) + 1) // 2):
+            continue
+        url = resolve(uri)
+        if url.rstrip("/") == avoid.rstrip("/") or _is_portal(name, url):
+            continue
+        if probe(url) == "ok":
+            return url
+    return None
 
 
 def parse(text: str) -> list[dict]:
@@ -150,6 +323,8 @@ def resolve(url: str) -> str:
 def _prompt(topic: str, limit: int) -> str:
     return (
         f"Search the web and list up to {limit} individual scholarship schemes for: {topic}\n\n"
+        f"Today is {date.today():%d %B %Y}. Only schemes that are open now or will open "
+        "later - leave out every scheme whose last date to apply has already passed.\n\n"
         "Rules:\n"
         "- One entry per scheme. Never an entry for a portal, a directory or a list of "
         "schemes (for example the National Scholarship Portal home page, or a Buddy4Study "
@@ -197,6 +372,49 @@ def _dedupe(candidates: list[dict]) -> list[dict]:
         seen_names.add(name_key)
         out.append(c)
     return out
+
+
+_STOP = {
+    "scheme", "scholarship", "scholarships", "for", "the", "of", "and", "in", "to",
+    "a", "an", "students", "student", "national", "government", "india", "indian",
+}
+
+
+def _words(text: str) -> set[str]:
+    return {w for w in re.findall(r"[a-z0-9]+", (text or "").lower()) if len(w) > 2 and w not in _STOP}
+
+
+def _is_portal(name: str, url: str) -> bool:
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    bare = parsed.path in ("", "/") and not parsed.query
+    if bare and any(host == s.lstrip(".") or host.endswith(s) for s in _PORTAL_SUFFIXES):
+        return True
+    return bare and bool(_PORTAL_NAME.search(name))
+
+
+def _status(url: str) -> int | None:
+    """The status a page answers with, or None when nothing answered at all.
+
+    GET rather than HEAD: enough government servers answer HEAD with 405 or 404
+    while serving the page to GET that HEAD would drop real schemes. Streamed,
+    so only the headers are read.
+    """
+    try:
+        with requests.get(url, timeout=CHECK_TIMEOUT, stream=True, allow_redirects=True,
+                          headers={"User-Agent": "Mozilla/5.0 scholarship-discovery/1.0"}) as answer:
+            return answer.status_code
+    except requests.RequestException:
+        return None
+
+
+def _date(value) -> date | None:
+    if not isinstance(value, str) or not _ISO_DATE.match(value):
+        return None
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        return None
 
 
 def _is_web(url: str) -> bool:

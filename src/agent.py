@@ -101,6 +101,17 @@ class CatalogueSource(RuntimeError):
 
 CATALOGUE_MIN_SCHEMES = 6
 
+
+class ClosedScheme(RuntimeError):
+    """The scheme's last date to apply has passed.
+
+    Raised only for a draft - see `for_draft` on run(). A listing made from
+    it would be closed on the day it was saved, and the platform lists schemes
+    a student can still apply to. The sweep re-reads watched pages without it,
+    because a page whose scheme has closed is still worth watching for the
+    next cycle's dates.
+    """
+
 _PORTAL_WORDS = (
     "portal",
     "single-window",
@@ -157,6 +168,7 @@ class ScholarshipAgent:
 
     def run(
         self, raw_input: str, reuse: bool = True, ground_on_failure: bool = True,
+        for_draft: bool = False,
     ) -> tuple[dict, Report]:
         """Extract, and report whether the source moved since it was last read.
 
@@ -174,6 +186,16 @@ class ScholarshipAgent:
         report = Report()
         is_url = text.startswith(("http://", "https://"))
         seed = None
+
+        # Before the cache, not after it. scholarships.gov.in/ had been read
+        # before the catalogue refusal existed, so it came back as "unchanged
+        # since last read" - skipping every check below - and was offered as a
+        # draft called "National Scholarship Portal Schemes". Only for a draft:
+        # the sweep may be watching such a page and should go on doing so.
+        if for_draft and is_url and _is_portal_home(text):
+            raise CatalogueSource(
+                f"{text} is a portal's home page, not one scholarship. "
+                "Use Find scholarships to list its individual schemes.")
 
         if is_url:
             try:
@@ -196,6 +218,10 @@ class ScholarshipAgent:
             self._check_freshness(cached)
             if is_url and self.cache:
                 self.cache.watch(text)
+            # A cached record is refused on the same terms as a fresh one: it
+            # may have been stored before any of these refusals existed.
+            if for_draft:
+                _refuse_if_closed(cached)
             return cached, report
 
         if seed is not None:
@@ -239,6 +265,8 @@ class ScholarshipAgent:
         if is_url and self.cache:
             self.cache.watch(text)
 
+        if for_draft:
+            _refuse_if_closed(result)
         return result, report
 
     # --- caching ---------------------------------------------------------
@@ -364,6 +392,23 @@ class ScholarshipAgent:
             tools=[types.Tool(google_search=types.GoogleSearch())],
             automatic_function_calling=_NO_AFC,
         )
+
+
+def _refuse_if_closed(record: dict) -> None:
+    closing = parse_date(record.get("closes_at"))
+    if closing and closing < date.today():
+        raise ClosedScheme(
+            f"{record.get('name') or 'This scheme'} closed on {closing:%d %B %Y}, so it was "
+            "not drafted - a listing made from it would be closed the day it was saved. "
+            "Read it again when the next cycle's dates are announced."
+        )
+
+
+def _is_portal_home(url: str) -> bool:
+    """A government site's bare home page: a department or a portal, never one
+    scheme. Same rule as src/search.py uses to leave one out of a search."""
+    from src.search import _is_portal
+    return _is_portal("", url)
 
 
 def _grounded_prompt(text: str, is_url: bool) -> str:

@@ -10,11 +10,21 @@ The rule the whole service is built around:
 
 > Never invent a value. If the source does not state it, return `null`.
 
-**It does not match students to scholarships, and it does not go looking for
-sources.** Matching is the Go API's `internal/matching`; finding a scheme worth
-reading is a person's job, and this reads what it is handed. The one exception
-is a paste too short to be a source, which is searched for and marked as such -
-see "How an extraction works".
+**It does not match students to scholarships.** Matching is the Go API's
+`internal/matching`.
+
+It can go looking for sources, as a separate first step: `POST /api/search`
+(`src/search.py`) takes a topic and returns individual schemes with their own
+pages - closed schemes, portal home pages and addresses that do not exist are
+left out, and every page is test-read so one the extractor cannot read (a site
+that blocks automated reading) is marked rather than offered as if it were
+fine. It returns a list and reads nothing; a person ticks which to read, and
+each is then read one scheme per source as below. A paste too short to be a
+source is still searched for and marked as such - see "How an extraction works".
+
+A draft is never made from a scheme whose closing date has passed, or from a
+government site's bare home page - including when the record comes from the
+cache.
 
 That division is the point of the record's shape. It is written against the Go
 API's `CuratedInput` rather than against what reads nicely off a web page, and
