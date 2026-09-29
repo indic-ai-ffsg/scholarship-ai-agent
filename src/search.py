@@ -128,17 +128,37 @@ class Candidate:
     readable: bool = True
 
 
-def find(client, model: str, topic: str | None = None, limit: int = 12) -> tuple[list[dict], list[str]]:
+def _quiet(event: dict) -> None:
+    """The progress callback when nobody is listening."""
+
+
+def _host(url: str) -> str:
+    return (urlparse(url).hostname or url).removeprefix("www.")
+
+
+def find(client, model: str, topic: str | None = None, limit: int = 12,
+         progress=None) -> tuple[list[dict], list[str]]:
     """Search for individual schemes on a topic.
 
     Returns the candidates worth offering and, for the ones that were not, one
     line each saying why - so the screen can say "3 left out: closed" rather
     than quietly showing fewer than were asked for.
+
+    `progress(event)` is told what is happening as it happens: the search, what
+    it returned, and each page as it is checked - see server.py's search jobs,
+    which stream these to the panel. A search takes up to a minute, and "What
+    is it doing, which sources is it checking" was the first thing asked of it
+    in testing (2026-09-29). Each event is a dict with `stage` (search, check,
+    done) and a `message` in plain words; a check also carries `url`, `name`
+    and `status`, so the screen can update one row in place rather than append
+    a line per state.
     """
+    say = progress or _quiet
     topic = (topic or "").strip()[:MAX_TOPIC_CHARS] or DEFAULT_TOPIC
     limit = max(1, min(int(limit or 12), MAX_RESULTS))
 
     log.info("Searching the web for: %s", topic)
+    say({"stage": "search", "message": f"Searching the web for “{topic}”"})
     response = client.models.generate_content(
         model=model,
         contents=_prompt(topic, limit),
@@ -151,9 +171,15 @@ def find(client, model: str, topic: str | None = None, limit: int = 12) -> tuple
     )
 
     text = getattr(response, "text", None) or ""
-    candidates, dropped = vet(parse(text), grounding_links(response), date.today())
+    parsed = parse(text)
+    say({"stage": "search", "count": len(parsed),
+         "message": f"The search returned {len(parsed)} scheme{'' if len(parsed) == 1 else 's'} — checking each one"})
+    candidates, dropped = vet(parsed, grounding_links(response), date.today(), progress=say)
     candidates = candidates[:limit]
 
+    say({"stage": "done", "count": len(candidates),
+         "message": f"{len(candidates)} ready to read"
+                    + (f", {len(dropped)} left out" if dropped else "")})
     log.info("Found %d scheme(s); left out %d.", len(candidates), len(dropped))
     for why in dropped:
         log.info("Left out: %s", why)
@@ -161,7 +187,7 @@ def find(client, model: str, topic: str | None = None, limit: int = 12) -> tuple
 
 
 def vet(candidates: list[dict], links: list[tuple[str, str]], today: date,
-        probe=None) -> tuple[list[dict], list[str]]:
+        probe=None, progress=None) -> tuple[list[dict], list[str]]:
     """Keep what is open, is one scheme, and can actually be read.
 
     `probe(url)` answers "ok", "missing" (404/410) or "unreadable"; it is a
@@ -169,35 +195,69 @@ def vet(candidates: list[dict], links: list[tuple[str, str]], today: date,
     run first, so nothing is fetched for a scheme that has closed.
     """
     probe = probe or _probe
+    say = progress or _quiet
     kept: list[dict] = []
     dropped: list[str] = []
 
+    def check(c, status, message, url=None):
+        # One row per scheme on the screen, keyed by the address it was
+        # offered with; a swap reports the new address beside it.
+        say({"stage": "check", "key": c["_key"], "name": c["name"],
+             "url": url or c["url"], "status": status, "message": message})
+
     pending: list[dict] = []
     for c in candidates:
+        c["_key"] = c["url"]
         closes = _date(c.get("closes_at"))
         if closes and closes < today:
             dropped.append(f"{c['name']} - closed on {closes:%d %B %Y}")
+            check(c, "closed", f"Closed on {closes:%d %B %Y} — left out")
             continue
         c["url"] = resolve(c["url"])
         if _is_portal(c["name"], c["url"]):
             dropped.append(f"{c['name']} - {c['url']} lists many schemes, not one")
+            check(c, "portal", "A portal listing many schemes — left out")
             continue
         pending.append(c)
 
-    verdicts = _probe_all([c["url"] for c in pending], probe)
+    def probed(c):
+        """The probe, narrated: 'checking' when it starts, the verdict when it
+        ends. Runs on the pool's threads; the callback must be thread-safe,
+        which server.py's Job.emit is."""
+        def run(url):
+            check(c, "checking", f"Checking {_host(url)}…")
+            verdict = probe(url)
+            check(c, {"ok": "readable", "missing": "missing"}.get(verdict, "unreadable"),
+                  {"ok": f"{_host(url)} can be read",
+                   "missing": f"{_host(url)} does not exist"}.get(
+                      verdict, f"{_host(url)} blocks automated reading"))
+            return verdict
+        return run
+
+    by_url = {c["url"]: c for c in pending}
+    verdicts = _probe_all(list(by_url), lambda u: probed(by_url[u])(u))
     for c in pending:
         verdict = verdicts.get(c["url"], "unreadable")
         if verdict != "ok":
+            check(c, "looking", f"Looking for another page about {c['name']}…")
             better = _match(c["name"], links, probe, avoid=c["url"])
             if better:
                 log.info("Swapped %s (%s) for %s from the search results.", c["url"], verdict, better)
                 c["url"], verdict = better, "ok"
+                check(c, "swapped", f"Found a readable page on {_host(better)}", url=better)
+            else:
+                check(c, "missing" if verdict == "missing" else "unreadable",
+                      "No other page found — left out" if verdict == "missing"
+                      else "No readable page — offered unticked")
         if verdict == "missing":
             dropped.append(f"{c['name']} - its address does not exist "
                            "and the search had no other page for it")
             continue
         c["readable"] = verdict == "ok"
         kept.append(c)
+
+    for c in kept:
+        c.pop("_key", None)
 
     # Readable first: they are the ones worth ticking.
     kept.sort(key=lambda c: not c["readable"])

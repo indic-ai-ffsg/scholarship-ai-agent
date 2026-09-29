@@ -153,6 +153,58 @@ def start_job(items: list[str], use_cache: bool) -> Job:
     return job
 
 
+def start_search_job(topic: str, limit: int) -> Job:
+    """A search, narrated: the same Job and event stream a run uses.
+
+    POST /api/search answers once, after up to a minute of silence, and "what is
+    it doing, which sources is it checking" was the first thing asked of it in
+    testing (2026-09-29). This runs the same search on a thread and emits a
+    `progress` event for each thing src.search reports - the query, what came
+    back, every page as it is checked and what was found - then `search_done`
+    with the candidates. The panel follows it at /api/runs/<id>/events, like a
+    run, so there is one streaming path and not two.
+    """
+    job = Job([topic], use_cache=False)
+    with _jobs_lock:
+        jobs[job.id] = job
+        for stale in sorted(jobs.values(), key=lambda j: j.created)[:-JOB_RETENTION]:
+            jobs.pop(stale.id, None)
+    threading.Thread(target=_search_work, args=(job, topic, limit),
+                     name=f"search-{job.id}", daemon=True).start()
+    return job
+
+
+def _search_work(job: Job, topic: str, limit: int) -> None:
+    started = time.time()
+    try:
+        try:
+            agent = ScholarshipAgent(use_cache=False)
+        except ValueError as exc:
+            job.emit("fatal", message=str(exc))
+            return
+        try:
+            found, dropped = search.find(
+                agent.client, agent.model_name, topic, limit,
+                # Job.emit takes its own lock, so the probe threads may call it.
+                progress=lambda event: job.emit("progress", **event),
+            )
+        except search.SearchError as exc:
+            log.warning("Search gave nothing usable: %s", exc)
+            job.emit("search_error",
+                     message="The search came back without a usable list. Try a narrower topic.")
+        except genai_errors.APIError as exc:
+            job.emit("search_error", message=f"The model could not search: {_first_line(exc)}")
+        except Exception as exc:
+            log.exception("Unexpected failure searching for %s", topic)
+            job.emit("search_error", message=f"unexpected {type(exc).__name__}: {_first_line(exc)}")
+        else:
+            job.emit("search_done", topic=topic.strip() or search.DEFAULT_TOPIC,
+                     candidates=found, left_out=dropped,
+                     seconds=round(time.time() - started, 1))
+    finally:
+        job.emit("done", cancelled=False)
+
+
 def _work(job: Job) -> None:
     _routes[threading.get_ident()] = job
     try:
@@ -240,7 +292,7 @@ class Handler(BaseHTTPRequestHandler):
                 "service": "scholarship discovery",
                 "ui": "the admin panel, under Discovery",
                 "routes": [
-                    "/api/health", "/api/schema", "/api/search", "/api/runs",
+                    "/api/health", "/api/schema", "/api/search", "/api/searches", "/api/runs",
                     "/api/runs/<id>/events", "/api/refresh",
                 ],
             })
@@ -268,6 +320,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._create_run()
         if path == "/api/search":
             return self._search()
+        if path == "/api/searches":
+            return self._start_search()
         if path == "/api/refresh":
             started = sweeper.start_in_background(reason="asked for")
             return self._json({"started": started, "running": True}, status=202)
@@ -379,6 +433,16 @@ class Handler(BaseHTTPRequestHandler):
             "left_out": dropped,
             "seconds": round(time.time() - started, 1),
         })
+
+    def _start_search(self) -> None:
+        """Start a narrated search; follow it at /api/runs/<id>/events."""
+        body = self._body()
+        if body is None:
+            return
+        topic = body.get("topic") if isinstance(body.get("topic"), str) else ""
+        limit = body.get("limit") if isinstance(body.get("limit"), int) else 12
+        job = start_search_job(topic, limit)
+        self._json({"job_id": job.id}, status=202)
 
     def _logo(self) -> None:
         """Fetch a sponsor's mark, so the panel can attach it to a draft.

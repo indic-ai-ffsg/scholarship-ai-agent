@@ -164,3 +164,36 @@ def test_readable_candidates_come_first():
     b = {**GOOD, "name": "Open scheme", "url": "https://open.example.org/b"}
     kept, _ = vet([a, b], [], TODAY, probe=_web({a["url"]: "unreadable"}))
     assert [c["name"] for c in kept] == ["Open scheme", "Blocked scheme"]
+
+
+# --- narration: what the panel shows while a search runs (2026-09-29) --------
+
+def test_every_candidate_is_narrated_to_a_verdict():
+    events = []
+    rows = [
+        {**GOOD, "name": "Open scheme", "url": "https://open.example.org/a"},
+        {**GOOD, "name": "Blocked scheme", "url": "https://blocked.example.org/b"},
+        {**GOOD, "name": "Old scheme", "url": "https://old.example.org/c", "closes_at": "2026-07-31"},
+        {**GOOD, "name": "Portal Schemes", "url": "https://scholarships.gov.in/"},
+    ]
+    vet(rows, [], TODAY, probe=_web({"https://blocked.example.org/b": "unreadable"}),
+        progress=events.append)
+
+    last = {}
+    for e in events:
+        assert e["stage"] == "check" and e["message"]
+        last[e["key"]] = e["status"]
+    assert last == {
+        "https://open.example.org/a": "readable",
+        "https://blocked.example.org/b": "unreadable",
+        "https://old.example.org/c": "closed",
+        "https://scholarships.gov.in/": "portal",
+    }
+    # Each probed page was announced before it was judged.
+    statuses = [e["status"] for e in events if e["key"] == "https://open.example.org/a"]
+    assert statuses[0] == "checking"
+
+
+def test_the_internal_key_does_not_leak_into_candidates():
+    kept, _ = vet([GOOD], [], TODAY, probe=_web({}), progress=lambda e: None)
+    assert "_key" not in kept[0]
